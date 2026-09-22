@@ -1,0 +1,20 @@
+services:
+  alerts:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # 同一 source 的静默归段间隔（秒），按需调整
+      SILENCE_INTERVAL_SECONDS: "300"
+      DATABASE_PATH: /data/alerts.db
+    volumes:
+      - alerts-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  alerts-data:
