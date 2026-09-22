@@ -146,6 +146,40 @@ class SegmentPatternsResponse(BaseModel):
     patterns: list[SegmentPatternOut]
 
 
+class DurationReportBucket(BaseModel):
+    """一个左闭右开时长桶 [bucket_start_seconds, bucket_end_seconds) 的段计数。
+
+    - 桶从 0 起按 bucket_seconds 等宽划分，覆盖到最长持续时长所在的桶；
+    - 没有段落入的桶同样输出（segment_count 为 0）；桶按时长升序排列。
+    """
+
+    bucket_start_seconds: float
+    bucket_end_seconds: float
+    segment_count: int
+
+
+class SegmentDurationReportResponse(BaseModel):
+    """当前事件段持续时长分布报告（单一只读快照，纯读，不改任何表）。
+
+    统计可选 source 与闭区间时间窗 [start_at, end_at]（两端均含；段的
+    时间范围与窗口**有交集**即纳入）内当前事件段的持续时长
+    （ended_at - started_at，秒）。无匹配段时 sample_count 为 0，
+    各统计量为 null，buckets 为空列表。
+    """
+
+    source: str | None
+    start_at: datetime | None
+    end_at: datetime | None
+    bucket_seconds: float
+    sample_count: int
+    min_seconds: float | None
+    max_seconds: float | None
+    mean_seconds: float | None
+    median_seconds: float | None
+    p90_seconds: float | None
+    buckets: list[DurationReportBucket]
+
+
 class WithdrawResponse(BaseModel):
     """误报事件撤回结果。
 

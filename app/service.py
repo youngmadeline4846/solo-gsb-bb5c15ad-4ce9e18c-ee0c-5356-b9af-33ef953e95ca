@@ -53,6 +53,16 @@
 - window_length 非正整数或非有限时间范围抛 ValueError（调用方回 422）；
   仅执行 SELECT，不改写任何表。
 
+持续时长分布报告（segment_duration_report，纯读）：
+- 在调用方提供的同一只读快照内扫描当前事件段（可选 source 精确过滤与
+  [start_ts, end_ts] 闭区间过滤：段的时间范围与查询闭区间有交集即纳入），
+  计算每段 ended_at - started_at 的持续秒数（整数微秒精度）；
+- 返回样本数、最短/最长、均值、中位数与 P90（线性插值分位数），并按
+  bucket_seconds 生成从 0 起的等宽左闭右开时长桶（空桶同样输出，桶按
+  时长升序稳定输出）；无匹配段时各统计量为 None、桶列表为空；
+- 非法时间范围、非正/非有限桶长或桶数超过上限抛 ValueError（调用方回 422）；
+  仅执行 SELECT，不改写任何表。
+
 变更水位历史快照（get_segment_snapshot，纯读）：
 - 在调用方提供的同一只读事务内，以 segment_changes 为唯一事实来源重建
   指定变更水位（at_change_id）时刻的段状态：每个 segment_id 取不晚于水位的
@@ -467,6 +477,152 @@ def segment_patterns(
         "scanned_segment_count": len(order),
         "patterns": patterns,
     }
+
+
+# 持续时长分布报告的防御上限：避免极小桶长/极大时长导致输出无界桶位
+MAX_DURATION_BUCKETS = 10_000
+
+
+def _percentile_us(sorted_values: list[int], q: float) -> float:
+    """有序整数微秒序列的 q 分位数（线性插值，与 numpy 默认方法一致）。
+
+    在 h = (n - 1) * q 处取值，落在两个样本之间时按距离线性插值；
+    q=0.5 即中位数（偶数样本为中间两值的平均），q=0.9 即 P90。
+    """
+    n = len(sorted_values)
+    h = (n - 1) * q
+    lo = math.floor(h)
+    hi = math.ceil(h)
+    if lo == hi:
+        return float(sorted_values[lo])
+    frac = h - lo
+    return sorted_values[lo] + (sorted_values[hi] - sorted_values[lo]) * frac
+
+
+def segment_duration_report(
+    conn: sqlite3.Connection,
+    *,
+    source: str | None = None,
+    start_ts: float | None = None,
+    end_ts: float | None = None,
+    bucket_seconds: float,
+) -> dict:
+    """当前事件段持续时长分布报告（纯读）。
+
+    - source 为 None 时统计全部来源，否则精确匹配该 source；
+      start_ts/end_ts 为可选闭区间边界（epoch 秒，两端均含）：段的时间
+      范围 [started_at, ended_at] 与查询闭区间**有交集**即纳入统计——
+      段终点不早于 start_ts 且段起点不晚于 end_ts；
+    - 每段持续时长 = ended_at - started_at（秒），以整数微秒计算，避免
+      大 epoch 基值上的浮点误差；返回样本数、最短/最长、均值、中位数与
+      P90（分位数采用线性插值，与 numpy 默认方法一致；均值与分位数取整
+      到微秒粒度）；无匹配段时样本数为 0，各统计量为 None，buckets 为空；
+    - 时长桶从 0 起按 bucket_seconds 等宽划分（左闭右开，恰好等于桶
+      边界的时长落入右侧桶），覆盖到最长时长所在的桶；无段落入的空桶
+      同样输出，桶按时长升序稳定输出；
+    - start_ts > end_ts、bucket_seconds 非正/非有限、桶宽不足 1 微秒
+      或桶数超过 MAX_DURATION_BUCKETS 时抛 ValueError（调用方回 422）。
+
+    调用方应使用 read_only_session：本函数只执行 SELECT，在同一快照内
+    完成全部读取与统计，不改写任何表。
+    """
+    if start_ts is not None and not math.isfinite(start_ts):
+        raise ValueError("非法时间范围")
+    if end_ts is not None and not math.isfinite(end_ts):
+        raise ValueError("非法时间范围")
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        raise ValueError("start_at 不能晚于 end_at")
+    if (
+        not isinstance(bucket_seconds, (int, float))
+        or isinstance(bucket_seconds, bool)
+        or not math.isfinite(bucket_seconds)
+        or bucket_seconds <= 0
+    ):
+        raise ValueError("bucket_seconds 必须为正数")
+    # 与 event_metrics 相同：桶宽换算为整数微秒，规避浮点除法边界误差
+    width_us = int(round(bucket_seconds * 1_000_000))
+    if width_us <= 0:
+        raise ValueError("bucket_seconds 过小（最小粒度为 1 微秒）")
+
+    clauses: list[str] = []
+    params: list = []
+    if source is not None:
+        clauses.append("source = ?")
+        params.append(source)
+    if start_ts is not None:
+        clauses.append("end_ts >= ?")  # 段终点不早于窗口起点（闭区间含边界）
+        params.append(start_ts)
+    if end_ts is not None:
+        clauses.append("start_ts <= ?")  # 段起点不晚于窗口终点（闭区间含边界）
+        params.append(end_ts)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    rows = conn.execute(
+        f"""
+        SELECT id, start_ts, end_ts
+        FROM segments
+        {where}
+        ORDER BY id
+        """,
+        params,
+    ).fetchall()
+
+    # 时长一律换算为整数微秒（与 event_metrics 相同的精度策略）
+    durations_us = sorted(
+        (
+            datetime.fromtimestamp(r["end_ts"], tz=timezone.utc)
+            - datetime.fromtimestamp(r["start_ts"], tz=timezone.utc)
+        ) // timedelta(microseconds=1)
+        for r in rows
+    )
+
+    def _seconds(us: float) -> float:
+        # 取整到微秒粒度（0.5 微秒向上进位）再转秒，避免浮点尾巴
+        return math.floor(us + 0.5) / 1_000_000
+
+    report = {
+        "source": source,
+        "start_at": _iso(start_ts) if start_ts is not None else None,
+        "end_at": _iso(end_ts) if end_ts is not None else None,
+        "bucket_seconds": float(bucket_seconds),
+        "sample_count": len(durations_us),
+        "min_seconds": None,
+        "max_seconds": None,
+        "mean_seconds": None,
+        "median_seconds": None,
+        "p90_seconds": None,
+        "buckets": [],
+    }
+    if not durations_us:
+        return report
+
+    max_us = durations_us[-1]
+    bucket_count = max_us // width_us + 1
+    if bucket_count > MAX_DURATION_BUCKETS:
+        raise ValueError(
+            f"桶数超过上限：时长范围/桶长最多生成 {MAX_DURATION_BUCKETS} 个桶"
+        )
+
+    counts = [0] * bucket_count
+    for duration in durations_us:
+        counts[duration // width_us] += 1
+
+    report.update(
+        min_seconds=_seconds(durations_us[0]),
+        max_seconds=_seconds(max_us),
+        mean_seconds=_seconds(sum(durations_us) / len(durations_us)),
+        median_seconds=_seconds(_percentile_us(durations_us, 0.5)),
+        p90_seconds=_seconds(_percentile_us(durations_us, 0.9)),
+        buckets=[
+            {
+                "bucket_start_seconds": (i * width_us) / 1_000_000,
+                "bucket_end_seconds": ((i + 1) * width_us) / 1_000_000,
+                "segment_count": counts[i],
+            }
+            for i in range(bucket_count)
+        ],
+    )
+    return report
 
 
 def _record_change(

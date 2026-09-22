@@ -22,6 +22,7 @@ from .schemas import (
     MaintenanceWindowOut,
     ResegmentationPreviewResponse,
     SegmentChangesPage,
+    SegmentDurationReportResponse,
     SegmentOut,
     SegmentPatternsResponse,
     SegmentSnapshotPage,
@@ -42,7 +43,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app = FastAPI(
         title="设备告警事件段聚合服务",
-        version="1.7.0",
+        version="1.8.0",
         lifespan=lifespan,
     )
 
@@ -261,6 +262,51 @@ def create_app(settings: Settings) -> FastAPI:
                     window_length=window_length,
                 )
         except ValueError as exc:  # 窗口长度/时间范围非法 → 422
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get(
+        "/segments/duration-report",
+        response_model=SegmentDurationReportResponse,
+    )
+    def segment_duration_report(
+        source: str | None = Query(default=None, min_length=1, max_length=256),
+        start_at: datetime | None = Query(default=None),
+        end_at: datetime | None = Query(default=None),
+        bucket_seconds: float = Query(..., gt=0),
+    ) -> dict:
+        """当前事件段持续时长分布报告（**单一只读快照**，纯读）。
+
+        - ``source`` 可选（精确匹配；不传则统计全部来源），``start_at`` /
+          ``end_at`` 为可选**闭区间**边界（两端均含，ISO 8601，无时区按
+          UTC 处理）：段的时间范围 [started_at, ended_at] 与该闭区间
+          **有交集**即纳入统计；
+        - 每段持续时长 = ended_at - started_at（秒）；返回样本数、最短/
+          最长、均值、中位数与 P90（线性插值分位数）；无匹配段时样本数
+          为 0，各统计量为 null、buckets 为空；
+        - ``bucket_seconds`` 必填：时长桶从 0 起等宽划分（左闭右开），
+          覆盖到最长时长所在的桶，空桶同样输出，桶按时长升序稳定输出；
+        - 全部读取在同一 query_only 只读快照内完成，不改写任何表；
+          ``start_at`` 晚于 ``end_at``、桶长非正/非数字或桶数超过
+          10000 时返回 422。
+        """
+        if start_at is not None and start_at.tzinfo is None:
+            start_at = start_at.replace(tzinfo=timezone.utc)
+        if end_at is not None and end_at.tzinfo is None:
+            end_at = end_at.replace(tzinfo=timezone.utc)
+        if start_at is not None and end_at is not None and start_at > end_at:
+            raise HTTPException(
+                status_code=422, detail="start_at 不能晚于 end_at"
+            )
+        try:
+            with read_only_session(settings.database_path) as conn:
+                return service.segment_duration_report(
+                    conn,
+                    source=source,
+                    start_ts=start_at.timestamp() if start_at else None,
+                    end_ts=end_at.timestamp() if end_at else None,
+                    bucket_seconds=bucket_seconds,
+                )
+        except ValueError as exc:  # 时间范围/桶长/桶数等输入错误 → 422
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/segments/{segment_id}", response_model=SegmentOut)

@@ -1849,5 +1849,232 @@ class SegmentPatternsTestCase(unittest.TestCase):
         )
 
 
+class SegmentDurationReportTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "test.db")
+        init_db(self.db_path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def submit(self, source, event_id, occurred_ts, severity="info"):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.ingest_event(
+                conn,
+                source=source,
+                event_id=event_id,
+                occurred_ts=occurred_ts,
+                severity=severity,
+                silence=SILENCE,
+            )
+
+    def withdraw(self, source, event_id):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.withdraw_event(
+                conn, source=source, event_id=event_id, silence=SILENCE
+            )
+
+    def report(self, **kwargs):
+        with read_only_session(self.db_path) as conn:
+            return service.segment_duration_report(conn, **kwargs)
+
+    def _three_segments(self):
+        # SILENCE=10：段 A [0,5]（5s）、段 B [20,20]（0s）、段 C [40,48]（8s）
+        self.submit("s1", "e1", 0.0, "warning")
+        self.submit("s1", "e2", 5.0, "error")
+        self.submit("s1", "e3", 20.0, "debug")
+        self.submit("s1", "e4", 40.0, "critical")
+        self.submit("s1", "e5", 48.0, "info")
+
+    def test_stats_and_buckets(self):
+        self._three_segments()
+        r = self.report(source="s1", bucket_seconds=2.0)
+        self.assertEqual(r["source"], "s1")
+        self.assertIsNone(r["start_at"])
+        self.assertIsNone(r["end_at"])
+        self.assertEqual(r["bucket_seconds"], 2.0)
+        self.assertEqual(r["sample_count"], 3)
+        # 时长 [0, 5, 8]
+        self.assertEqual(r["min_seconds"], 0.0)
+        self.assertEqual(r["max_seconds"], 8.0)
+        self.assertEqual(r["mean_seconds"], 4.333333)  # 13/3 取整到微秒
+        self.assertEqual(r["median_seconds"], 5.0)
+        self.assertEqual(r["p90_seconds"], 7.4)  # 5 + 0.8 * (8 - 5)
+        # 桶宽 2：[0,2) [2,4) [4,6) [6,8) [8,10)，空桶同样输出
+        self.assertEqual(
+            r["buckets"],
+            [
+                {"bucket_start_seconds": 0.0, "bucket_end_seconds": 2.0,
+                 "segment_count": 1},
+                {"bucket_start_seconds": 2.0, "bucket_end_seconds": 4.0,
+                 "segment_count": 0},
+                {"bucket_start_seconds": 4.0, "bucket_end_seconds": 6.0,
+                 "segment_count": 1},
+                {"bucket_start_seconds": 6.0, "bucket_end_seconds": 8.0,
+                 "segment_count": 0},
+                {"bucket_start_seconds": 8.0, "bucket_end_seconds": 10.0,
+                 "segment_count": 1},
+            ],
+        )
+        total = sum(b["segment_count"] for b in r["buckets"])
+        self.assertEqual(total, r["sample_count"])
+
+    def test_even_sample_median_and_p90_interpolation(self):
+        # 时长 [5, 8]：中位数为两者均值，P90 线性插值
+        self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", 5.0)
+        self.submit("s1", "e3", 40.0)
+        self.submit("s1", "e4", 48.0)
+        r = self.report(bucket_seconds=10.0)
+        self.assertEqual(r["sample_count"], 2)
+        self.assertEqual(r["median_seconds"], 6.5)
+        self.assertEqual(r["p90_seconds"], 7.7)  # 5 + 0.9 * (8 - 5)
+        self.assertEqual(r["mean_seconds"], 6.5)
+
+    def test_bucket_boundary_is_left_closed_right_open(self):
+        # 时长恰好等于桶宽整倍数：落入右侧桶
+        self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", 10.0)  # 时长 10s，桶宽 5 → 第 3 桶 [10,15)
+        r = self.report(bucket_seconds=5.0)
+        self.assertEqual(
+            [b["segment_count"] for b in r["buckets"]], [0, 0, 1]
+        )
+        self.assertEqual(r["buckets"][2]["bucket_start_seconds"], 10.0)
+        self.assertEqual(r["buckets"][2]["bucket_end_seconds"], 15.0)
+
+    def test_source_filter_and_overlap_window(self):
+        self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", 5.0)      # s1 段 A [0,5]
+        self.submit("s2", "x1", 100.0)
+        self.submit("s2", "x2", 108.0)    # s2 段 X [100,108]
+
+        r = self.report(source="s1", bucket_seconds=10.0)
+        self.assertEqual(r["sample_count"], 1)
+        self.assertEqual(r["max_seconds"], 5.0)
+
+        # 段终点不早于 start_ts 才算相交
+        r = self.report(start_ts=6.0, bucket_seconds=10.0)
+        self.assertEqual(r["sample_count"], 1)
+        self.assertEqual(r["max_seconds"], 8.0)
+        # 段起点不晚于 end_ts 才算相交
+        r = self.report(end_ts=5.0, bucket_seconds=10.0)
+        self.assertEqual(r["sample_count"], 1)
+        self.assertEqual(r["max_seconds"], 5.0)
+        # 闭区间边界：段终点 == start_ts、段起点 == end_ts 均算相交
+        r = self.report(start_ts=5.0, end_ts=100.0, bucket_seconds=10.0)
+        self.assertEqual(r["sample_count"], 2)
+        self.assertEqual(r["min_seconds"], 5.0)
+        self.assertEqual(r["max_seconds"], 8.0)
+        self.assertEqual(r["start_at"], service._iso(5.0))
+        self.assertEqual(r["end_at"], service._iso(100.0))
+
+    def test_empty_result_returns_null_stats_and_no_buckets(self):
+        self.submit("s1", "e1", 0.0)
+        r = self.report(source="ghost", bucket_seconds=10.0)
+        self.assertEqual(
+            r,
+            {
+                "source": "ghost",
+                "start_at": None,
+                "end_at": None,
+                "bucket_seconds": 10.0,
+                "sample_count": 0,
+                "min_seconds": None,
+                "max_seconds": None,
+                "mean_seconds": None,
+                "median_seconds": None,
+                "p90_seconds": None,
+                "buckets": [],
+            },
+        )
+
+    def test_single_event_segment_has_zero_duration(self):
+        self.submit("s1", "e1", 1000.0)
+        r = self.report(bucket_seconds=60.0)
+        self.assertEqual(r["sample_count"], 1)
+        self.assertEqual(r["min_seconds"], 0.0)
+        self.assertEqual(r["max_seconds"], 0.0)
+        self.assertEqual(r["mean_seconds"], 0.0)
+        self.assertEqual(r["median_seconds"], 0.0)
+        self.assertEqual(r["p90_seconds"], 0.0)
+        self.assertEqual(len(r["buckets"]), 1)
+        self.assertEqual(r["buckets"][0]["segment_count"], 1)
+
+    def test_fractional_duration_and_subsecond_buckets(self):
+        self.submit("s1", "e1", 1000.25)
+        self.submit("s1", "e2", 1000.75)  # 时长 0.5s
+        r = self.report(bucket_seconds=0.25)
+        self.assertEqual(r["min_seconds"], 0.5)
+        self.assertEqual(r["max_seconds"], 0.5)
+        # 0.5/0.25 = 2 → 第 3 桶 [0.5, 0.75)
+        self.assertEqual(
+            [b["segment_count"] for b in r["buckets"]], [0, 0, 1]
+        )
+        self.assertEqual(r["buckets"][2]["bucket_start_seconds"], 0.5)
+        self.assertEqual(r["buckets"][2]["bucket_end_seconds"], 0.75)
+
+    def test_reflects_current_segments_after_withdraw(self):
+        self.submit("s1", "e1", 0.0)
+        self.submit("s1", "e2", 20.0)
+        self.submit("s1", "bridge", 10.0)  # 桥接 → 单段 [0,20]，时长 20s
+        r = self.report(bucket_seconds=10.0)
+        self.assertEqual(r["sample_count"], 1)
+        self.assertEqual(r["max_seconds"], 20.0)
+        self.withdraw("s1", "bridge")      # 拆成两个 0s 段
+        r = self.report(bucket_seconds=10.0)
+        self.assertEqual(r["sample_count"], 2)
+        self.assertEqual(r["max_seconds"], 0.0)
+
+    def test_invalid_arguments_raise_value_error(self):
+        self.submit("s1", "e1", 0.0)
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=10.0, start_ts=100.0, end_ts=99.0)
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=10.0, start_ts=float("nan"))
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=10.0, end_ts=float("inf"))
+        for bad in (0.0, -1.0, float("nan"), float("inf"), True):
+            with self.assertRaises(ValueError):
+                self.report(bucket_seconds=bad)
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=1e-7)  # 不足 1 微秒
+
+    def test_bucket_count_capped(self):
+        # 链式事件构成时长 100s 的单段：100/0.01 → 10001 桶拒绝，9901 桶允许
+        for i in range(11):
+            self.submit("s1", f"e{i}", float(i) * 10.0)
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=0.01)
+        r = self.report(bucket_seconds=0.0101)
+        self.assertEqual(len(r["buckets"]), 9901)
+        # 无匹配段时不生成桶，极小桶长也不报错
+        r = self.report(source="ghost", bucket_seconds=0.000001)
+        self.assertEqual(r["buckets"], [])
+
+    def test_reads_consistent_snapshot(self):
+        self.submit("s1", "e1", 0.0)
+        with read_only_session(self.db_path) as conn:
+            kwargs = dict(source="s1", bucket_seconds=10.0)
+            r1 = service.segment_duration_report(conn, **kwargs)
+            self.submit("s1", "e2", 5.0)  # 快照开启后写入
+            r2 = service.segment_duration_report(conn, **kwargs)
+        self.assertEqual(r1, r2)
+        self.assertEqual(r2["sample_count"], 1)
+
+    def test_does_not_mutate_data(self):
+        self._three_segments()
+        with session(self.db_path) as conn:
+            segs_before = service.list_segments(conn)
+            changes_before = service.list_segment_changes(conn)
+        self.report(bucket_seconds=2.0)
+        self.report(source="s1", start_ts=0.0, end_ts=100.0, bucket_seconds=1.0)
+        with session(self.db_path) as conn:
+            self.assertEqual(service.list_segments(conn), segs_before)
+            self.assertEqual(service.list_segment_changes(conn), changes_before)
+
+
 if __name__ == "__main__":
     unittest.main()
