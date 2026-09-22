@@ -1,6 +1,6 @@
 # 设备告警事件段聚合服务
 
-基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。`GET /events` 提供事件审计查询：在单一只读快照内按 `(occurred_at, event_id)` 稳定排序、支持时间窗与 severity 多值过滤及游标分页；`GET /events/metrics` 在同一只读快照内按 `occurred_at` 将事件划入**左闭右开**等宽时间桶，返回每桶各 severity 计数、事件总数与涉及的不同 segment_id 数（无事件桶照常输出、按时间升序）。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步，并通过 `GET /segments/snapshot` 按**变更水位**重建任一历史时刻的段状态快照。运维人员可通过 `POST /segments/{id}/acknowledgements` 对事件段做**人工确认**：在事务内校验段的当前 revision 后追加**不可变**的确认审计记录（幂等键防重），并通过 `GET /segments/{id}/acknowledgements` 按确认序号升序查询。`POST /maintenance-windows` 可登记 **[start_at, end_at) 左闭右开、source 精确匹配的维护窗口**（允许重叠、事务化写入），`GET /maintenance-windows/{id}/events` 在**单一只读快照**内返回窗口覆盖的事件及其**当前 segment_id**，并按事件当前所在段划分为 `fully`（段整体在窗口内）与 `partially`（段还延伸到窗口之外）两类、按事件时间升序返回。`GET /segments/patterns` 在**单一只读快照**内扫描当前事件，提取每个 segment 内按发生时间排序的 **severity 序列**，以可配置的**连续窗口长度**生成规范化模式指纹，按指纹分组返回出现次数、涉及的 segment_id/source 及首次/最近发生时间。
+基于 FastAPI + SQLite 的告警汇聚服务：客户端上报离散告警事件，服务按 **source + 可配置静默间隔** 将乱序到达的事件归入同一事件段（segment），并保证 **event_id 幂等去重**——重复提交不改变任何计数。误报事件可通过 `DELETE /events/{source}/{event_id}` 撤回，服务在单事务内删除事件并按静默间隔重算其原段（删除/收缩/拆分）。`GET /events` 提供事件审计查询：在单一只读快照内按 `(occurred_at, event_id)` 稳定排序、支持时间窗与 severity 多值过滤及游标分页；`GET /events/metrics` 在同一只读快照内按 `occurred_at` 将事件划入**左闭右开**等宽时间桶，返回每桶各 severity 计数、事件总数与涉及的不同 segment_id 数（无事件桶照常输出、按时间升序）。每次段变更都会同事务写入**单调递增的变更流**，下游可通过 `GET /segment-changes` 做增量同步，并通过 `GET /segments/snapshot` 按**变更水位**重建任一历史时刻的段状态快照。运维人员可通过 `POST /segments/{id}/acknowledgements` 对事件段做**人工确认**：在事务内校验段的当前 revision 后追加**不可变**的确认审计记录（幂等键防重），并通过 `GET /segments/{id}/acknowledgements` 按确认序号升序查询。`POST /maintenance-windows` 可登记 **[start_at, end_at) 左闭右开、source 精确匹配的维护窗口**（允许重叠、事务化写入），`GET /maintenance-windows/{id}/events` 在**单一只读快照**内返回窗口覆盖的事件及其**当前 segment_id**，并按事件当前所在段划分为 `fully`（段整体在窗口内）与 `partially`（段还延伸到窗口之外）两类、按事件时间升序返回。`GET /segments/patterns` 在**单一只读快照**内扫描当前事件，提取每个 segment 内按发生时间排序的 **severity 序列**，以可配置的**连续窗口长度**生成规范化模式指纹，按指纹分组返回出现次数、涉及的 segment_id/source 及首次/最近发生时间。`GET /segments/duration-report` 则在**单一只读快照**内对**当前事件段**的持续时长（`ended_at - started_at`，秒）做分布统计：支持可选 `source` 与起止时间**闭区间**筛选（按段时间轴相交），返回样本数、最短/最长、均值、中位数、P90，以及按可配置 `bucket_seconds` 从 0 秒起划分的**左闭右开**时长桶（空桶照常返回、按桶序升序）。
 
 ## 快速开始
 
@@ -491,6 +491,50 @@ curl 'http://localhost:8000/segments/patterns?source=edge-gateway-01&start_at=20
 - **快照一致性与纯读**：全部扫描在同一只读事务快照内完成，请求期间的并发写入不影响本次结果，不会改写事件、段或变更流。
 - 参数校验失败（缺 `window_length`、长度非正/非整数/超过 1000、非法时间、`start_at > end_at`、空 `source`）统一返回 `422`。
 
+### 当前事件段持续时长分布报告 `GET /segments/duration-report`
+
+对**当前事件段**（segments 表实时状态；合并的被删段、撤回删除的段不计入）做只读的持续时长分布统计。整个请求在**单一只读快照事务**（`query_only` 连接）内完成：可按 `source`（可选，精确匹配）与起止时间**闭区间**（两端均含，按段时间轴 `[started_at, ended_at]` 与窗口**相交**筛选——单点接触也算相交）圈定样本段，对每段计算 `ended_at - started_at` 的**持续秒数**（`>= 0`，单事件段为 `0` 秒），返回样本数、最短/最长/均值、中位数与 P90，以及从 0 秒起按 `bucket_seconds` 等宽划分的**左闭右开**时长桶（`[bucket_start_seconds, bucket_end_seconds)`）。桶按桶序号**升序稳定输出，空桶照常返回**（`segment_count` 为 0）。
+
+```bash
+curl 'http://localhost:8000/segments/duration-report?source=edge-gateway-01&start_at=2026-09-20T00:00:00Z&end_at=2026-09-21T00:00:00Z&bucket_seconds=60'
+```
+
+```json
+{
+  "source": "edge-gateway-01",
+  "start_at": "2026-09-20T00:00:00+00:00",
+  "end_at": "2026-09-21T00:00:00+00:00",
+  "bucket_seconds": 60.0,
+  "sample_count": 2,
+  "min_seconds": 10.0,
+  "max_seconds": 30.0,
+  "mean_seconds": 20.0,
+  "median_seconds": 20.0,
+  "p90_seconds": 28.0,
+  "buckets": [
+    {"bucket_index": 0, "bucket_start_seconds": 0.0,  "bucket_end_seconds": 60.0, "segment_count": 2},
+    {"bucket_index": 1, "bucket_start_seconds": 60.0, "bucket_end_seconds": 120.0, "segment_count": 0}
+  ]
+}
+```
+
+查询参数：
+
+| 参数 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `source` | 否 | 不过滤（统计全部来源） | 精确匹配该来源（1–256 字符） |
+| `start_at` | 否 | 不限制 | 时间窗下界（**含边界**，闭区间），ISO 8601；无时区按 UTC 处理；不得晚于 `end_at` |
+| `end_at` | 否 | 不限制 | 时间窗上界（**含边界**，闭区间），ISO 8601；无时区按 UTC 处理 |
+| `bucket_seconds` | 是 | — | 时长桶宽（秒，**正数**，支持小数，最小粒度 1 微秒）；桶从 `0` 秒起等宽划分 |
+
+- **闭区间时间筛选**：段时间轴 `[started_at, ended_at]` 与 `[start_at, end_at]` 有交集即计入——判定条件为段起点 `<= end_at` 且段终点 `>= start_at`；段终点恰好等于窗口起点、或段起点恰好等于窗口终点（单点接触）都计入。不传时间参数表示不限制。
+- **统计量**：`min_seconds`/`max_seconds` 为最短/最长持续秒数；`mean_seconds` 为算术平均；`median_seconds` 与 `p90_seconds` 采用线性插值百分位（R-7 法，与 numpy 默认 `linear` 一致），偶数样本的中位数为中间两值的均值。**无样本时** `sample_count` 为 `0`，五个统计量均为 `null`。
+- **左闭右开时长桶**：桶 `i` 覆盖 `[i*bucket_seconds, (i+1)*bucket_seconds)`，持续时长恰好等于桶上限的段落入**下一个桶**；桶从 0 秒开始（不存在负时长），覆盖到最长样本所在桶为止，中间的空桶也按序输出。无样本（含未知 source、窗口不命中）时仍返回 **1 个** `[0, bucket_seconds)` 空桶。
+- **实时归属**：统计直接读当前 segments 表，迟到事件合并、误报撤回拆段后结果随之变化；0 秒单事件段计入 `[0, bucket_seconds)` 首桶。
+- **桶数上限 10000**：`floor(最长持续时长 / bucket_seconds) + 1` 超过 10000 时返回 `422`，防止极短桶长导致输出无界。
+- **快照一致性与纯读**：全部统计在同一只读事务快照内完成，请求期间的并发写入不影响本次结果，不会改写事件、段或变更流。
+- 参数校验失败（缺 `bucket_seconds`、空 `source`、`bucket_seconds <= 0`/非数字/小于 1 微秒、非法时间、`start_at > end_at`、桶数超上限）统一返回 `422`。
+
 ### 健康检查 `GET /healthz`
 
 ## 归段与 revision 规则
@@ -525,7 +569,7 @@ python3 -m unittest tests.test_service -v
 ```
 app/
   main.py      # FastAPI 路由与生命周期（启动时幂等建表）
-  service.py   # 归段/合并/去重/撤回核心逻辑、事件审计查询、时间桶统计、严重性序列模式指纹与变更水位快照
+  service.py   # 归段/合并/去重/撤回核心逻辑、事件审计查询、时间桶统计、严重性序列模式指纹、段持续时长分布报告与变更水位快照
   schemas.py   # 请求/响应模型与校验
   severity.py  # 告警级别定义、排序与 canonical 级别表
   db.py        # SQLite 连接、schema、事务

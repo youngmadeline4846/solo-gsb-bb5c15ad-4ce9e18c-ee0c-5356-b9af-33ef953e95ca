@@ -1670,3 +1670,183 @@ def test_patterns_is_read_only(client):
     assert client.get("/segments").json() == segs
     assert client.get("/segment-changes").json() == changes
     assert client.get("/events", params={"source": "gw-01"}).json() == events
+
+
+# ---- 当前事件段持续时长分布报告 GET /segments/duration-report ----
+
+def _duration_report(client, **params):
+    return client.get("/segments/duration-report", params=params)
+
+
+def test_duration_report_stats_and_buckets_with_empty_buckets(client):
+    # silence=60：a1@08:00、a2@08:00:10 同段（时长 10s）；
+    # b1@08:02、b2@08:02:30 另一段（时长 30s）
+    _post(client, "gw-01", "a1", "2026-09-20T08:00:00Z", "info")
+    _post(client, "gw-01", "a2", "2026-09-20T08:00:10Z", "error")
+    _post(client, "gw-01", "b1", "2026-09-20T08:02:00Z", "warning")
+    _post(client, "gw-01", "b2", "2026-09-20T08:02:30Z", "critical")
+    _post(client, "gw-02", "c", "2026-09-20T08:00:00Z")  # 其他 source：单点段时长 0
+
+    resp = _duration_report(client, source="gw-01", bucket_seconds=15)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["source"] == "gw-01"
+    assert body["start_at"] is None
+    assert body["end_at"] is None
+    assert body["bucket_seconds"] == 15.0
+    assert body["sample_count"] == 2
+    assert body["min_seconds"] == 10.0
+    assert body["max_seconds"] == 30.0
+    assert body["mean_seconds"] == 20.0
+    assert body["median_seconds"] == 20.0  # (10+30)/2
+    assert body["p90_seconds"] == 28.0     # 10 + 0.9*20
+
+    buckets = body["buckets"]
+    assert len(buckets) == 3  # 30s 恰为桶宽整数倍 → 第三桶；中间桶为空
+    assert [b["bucket_index"] for b in buckets] == [0, 1, 2]
+    assert [(b["bucket_start_seconds"], b["bucket_end_seconds"]) for b in buckets] == [
+        (0.0, 15.0), (15.0, 30.0), (30.0, 45.0),
+    ]
+    assert [b["segment_count"] for b in buckets] == [1, 0, 1]
+    # 桶按桶序稳定输出
+    assert [b["bucket_index"] for b in buckets] == list(range(len(buckets)))
+
+
+def test_duration_report_scans_all_sources_by_default(client):
+    _post(client, "gw-01", "a", "2026-09-20T08:00:00Z")
+    _post(client, "gw-02", "b", "2026-09-20T08:05:00Z")
+    body = _duration_report(client, bucket_seconds=60).json()
+    assert body["source"] is None
+    assert body["sample_count"] == 2
+    assert body["buckets"][0]["segment_count"] == 2  # 两个 0s 单点段
+
+
+def test_duration_report_closed_time_window_inclusive(client):
+    # A=[08:00,08:00:10]、B=[08:02,08:02:30]（silence=60 下另一段）
+    _post(client, "gw-01", "a1", "2026-09-20T08:00:00Z")
+    _post(client, "gw-01", "a2", "2026-09-20T08:00:10Z")
+    _post(client, "gw-01", "b1", "2026-09-20T08:02:00Z")
+    _post(client, "gw-01", "b2", "2026-09-20T08:02:30Z")
+
+    # 窗口 [08:00:10, 08:02:00]：A、B 各以单点接触，闭区间均计入
+    body = _duration_report(
+        client,
+        start_at="2026-09-20T08:00:10Z",
+        end_at="2026-09-20T08:02:00Z",
+        bucket_seconds=60,
+    ).json()
+    assert body["sample_count"] == 2
+    # 仅窗口起点恰好等于 A 的终点：A 计入（边界含）
+    body = _duration_report(
+        client, start_at="2026-09-20T08:00:10Z", bucket_seconds=60
+    ).json()
+    assert body["sample_count"] == 2
+    # 起点越过 A 终点 → A 排除
+    body = _duration_report(
+        client, start_at="2026-09-20T08:00:11Z", bucket_seconds=60
+    ).json()
+    assert body["sample_count"] == 1
+    assert body["max_seconds"] == 30.0
+
+
+def test_duration_report_half_open_buckets(client):
+    # 时长恰好 60s 必须落入 [60,120) 第二桶
+    _post(client, "gw-01", "a1", "2026-09-20T08:00:00Z")
+    _post(client, "gw-01", "a2", "2026-09-20T08:01:00Z")
+    body = _duration_report(client, source="gw-01", bucket_seconds=60).json()
+    assert len(body["buckets"]) == 2
+    assert [b["segment_count"] for b in body["buckets"]] == [0, 1]
+
+
+def test_duration_report_empty_report_shape(client):
+    body = _duration_report(client, source="ghost", bucket_seconds=60).json()
+    assert body == {
+        "source": "ghost",
+        "start_at": None,
+        "end_at": None,
+        "bucket_seconds": 60.0,
+        "sample_count": 0,
+        "min_seconds": None,
+        "max_seconds": None,
+        "mean_seconds": None,
+        "median_seconds": None,
+        "p90_seconds": None,
+        "buckets": [{
+            "bucket_index": 0,
+            "bucket_start_seconds": 0.0,
+            "bucket_end_seconds": 60.0,
+            "segment_count": 0,
+        }],
+    }
+
+
+def test_duration_report_reflects_current_segments(client):
+    _post(client, "gw-01", "a1", "2026-09-20T08:00:00Z")
+    _post(client, "gw-01", "a2", "2026-09-20T08:02:00Z")  # 间隔 > 60 → 另一段
+    _post(client, "gw-01", "a3", "2026-09-20T08:01:00Z", "critical")  # 桥接合并
+    body = _duration_report(client, source="gw-01", bucket_seconds=300).json()
+    assert body["sample_count"] == 1
+    assert body["max_seconds"] == 120.0
+
+    client.delete("/events/gw-01/a3")  # 拆回两个单点段
+    body = _duration_report(client, source="gw-01", bucket_seconds=300).json()
+    assert body["sample_count"] == 2
+    assert body["max_seconds"] == 0.0
+
+
+def test_duration_report_param_validation(client):
+    # 缺 bucket_seconds
+    assert _duration_report(client).status_code == 422
+    # 非正桶长 / 非数字
+    assert _duration_report(client, bucket_seconds=0).status_code == 422
+    assert _duration_report(client, bucket_seconds=-5).status_code == 422
+    assert _duration_report(client, bucket_seconds="soon").status_code == 422
+    # 空 source
+    assert _duration_report(client, source="", bucket_seconds=60).status_code == 422
+    # 非法时间
+    assert _duration_report(
+        client, bucket_seconds=60, start_at="soon"
+    ).status_code == 422
+    # start_at 晚于 end_at
+    assert _duration_report(
+        client,
+        bucket_seconds=60,
+        start_at="2026-09-20T09:00:00Z",
+        end_at="2026-09-20T08:00:00Z",
+    ).status_code == 422
+    # 桶数超过上限 10000（最长时长 > 10000s）
+    _post(client, "gw-01", "x1", "2026-09-20T08:00:00Z")
+    _post(client, "gw-01", "x2", "2026-09-20T11:00:00Z")  # 时长 10800s
+    assert _duration_report(client, source="gw-01", bucket_seconds=1).status_code == 422
+
+
+def test_duration_report_naive_datetime_treated_as_utc(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    body = _duration_report(
+        client,
+        start_at="2026-09-20 08:00:00",
+        end_at="2026-09-20 09:00:00",
+        bucket_seconds=60,
+    ).json()
+    assert body["sample_count"] == 1
+
+
+def test_duration_report_route_not_captured_by_segment_id(client):
+    # 静态路径必须优先于 /segments/{segment_id} 匹配，不能返回 404/422
+    assert _duration_report(client, bucket_seconds=60).status_code == 200
+
+
+def test_duration_report_is_read_only(client):
+    _post(client, "gw-01", "e1", "2026-09-20T08:00:00Z")
+    _post(client, "gw-01", "e2", "2026-09-20T08:00:10Z")
+    segs = client.get("/segments").json()
+    changes = client.get("/segment-changes").json()
+    for _ in range(3):
+        _duration_report(client, bucket_seconds=5)
+        _duration_report(
+            client, source="gw-01",
+            start_at="2026-09-20T00:00:00Z", end_at="2026-09-21T00:00:00Z",
+            bucket_seconds=10,
+        )
+    assert client.get("/segments").json() == segs
+    assert client.get("/segment-changes").json() == changes

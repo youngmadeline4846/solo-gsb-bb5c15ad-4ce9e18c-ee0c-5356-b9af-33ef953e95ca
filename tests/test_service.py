@@ -1849,5 +1849,201 @@ class SegmentPatternsTestCase(unittest.TestCase):
         )
 
 
+class SegmentDurationReportTestCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp.name, "test.db")
+        init_db(self.db_path)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def submit(self, source, event_id, occurred_ts, severity="info", silence=SILENCE):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.ingest_event(
+                conn,
+                source=source,
+                event_id=event_id,
+                occurred_ts=occurred_ts,
+                severity=severity,
+                silence=silence,
+            )
+
+    def withdraw(self, source, event_id):
+        with session(self.db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return service.withdraw_event(
+                conn, source=source, event_id=event_id, silence=SILENCE
+            )
+
+    def report(self, **kwargs):
+        with read_only_session(self.db_path) as conn:
+            return service.segment_duration_report(conn, **kwargs)
+
+    def _setup_segments(self):
+        # silence=30：s1 A=[1000,1010] 时长 10；B=[1100,1130] 时长 30
+        # （A 终点 1010 与 B 起点 1100 相距 90 > 30，各自独立成段）
+        self.submit("s1", "a1", 1000.0, silence=30)
+        self.submit("s1", "a2", 1010.0, silence=30)
+        self.submit("s1", "b1", 1100.0, silence=30)
+        self.submit("s1", "b2", 1130.0, silence=30)
+        self.submit("s2", "c", 2000.0)  # s2: C=[2000,2000] 时长 0（单点段）
+
+    def test_stats_and_buckets_include_empty_buckets(self):
+        self._setup_segments()
+        r = self.report(bucket_seconds=15)
+        # 时长样本 [0, 10, 30]
+        self.assertEqual(r["sample_count"], 3)
+        self.assertEqual(r["min_seconds"], 0.0)
+        self.assertEqual(r["max_seconds"], 30.0)
+        self.assertAlmostEqual(r["mean_seconds"], 40 / 3)
+        # R-7：n=3 时 median 取位置 1（10），P90 位置 1.8 → 10+0.8*20=26
+        self.assertEqual(r["median_seconds"], 10.0)
+        self.assertEqual(r["p90_seconds"], 26.0)
+
+        buckets = r["buckets"]
+        self.assertEqual(len(buckets), 3)  # 30s 恰为桶宽整数倍 → 落入第三桶
+        self.assertEqual([b["bucket_index"] for b in buckets], [0, 1, 2])
+        self.assertEqual(
+            [(b["bucket_start_seconds"], b["bucket_end_seconds"]) for b in buckets],
+            [(0.0, 15.0), (15.0, 30.0), (30.0, 45.0)],
+        )
+        self.assertEqual([b["segment_count"] for b in buckets], [2, 0, 1])
+
+    def test_buckets_are_left_closed_right_open(self):
+        # 时长恰好等于桶宽 → 落入下一个桶
+        self.submit("s1", "a1", 0.0, silence=1000)
+        self.submit("s1", "a2", 60.0, silence=1000)  # 单段时长 60
+        r = self.report(bucket_seconds=60)
+        self.assertEqual(r["sample_count"], 1)
+        self.assertEqual(len(r["buckets"]), 2)
+        self.assertEqual([b["segment_count"] for b in r["buckets"]], [0, 1])
+
+    def test_median_even_sample_count_interpolates(self):
+        self.submit("s1", "a", 1000.0)
+        self.submit("s1", "a2", 1010.0)  # 时长 10
+        self.submit("s2", "c", 2000.0)   # 时长 0
+        r = self.report(bucket_seconds=10)
+        self.assertEqual(r["sample_count"], 2)
+        self.assertEqual(r["median_seconds"], 5.0)   # (0+10)/2
+        self.assertEqual(r["p90_seconds"], 9.0)      # 0 + 0.9*10
+        self.assertEqual(r["mean_seconds"], 5.0)
+
+    def test_source_filter(self):
+        self._setup_segments()
+        r = self.report(source="s2", bucket_seconds=10)
+        self.assertEqual(r["source"], "s2")
+        self.assertEqual(r["sample_count"], 1)
+        self.assertEqual(r["min_seconds"], 0.0)
+        self.assertEqual(r["max_seconds"], 0.0)
+        self.assertEqual(len(r["buckets"]), 1)
+        self.assertEqual(r["buckets"][0]["segment_count"], 1)
+
+        r = self.report(source="ghost", bucket_seconds=10)
+        self.assertEqual(r["sample_count"], 0)
+
+    def test_closed_time_window_overlap_filter_inclusive_both_ends(self):
+        self._setup_segments()
+        # A=[1000,1010]、B=[1100,1130]、C=[2000,2000]
+        # 窗口 [1010,1100]：A 以单点 1010 接触、B 以单点 1100 接触，均计入
+        r = self.report(start_ts=1010.0, end_ts=1100.0, bucket_seconds=60)
+        self.assertEqual(r["sample_count"], 2)
+        self.assertEqual(r["min_seconds"], 10.0)
+        self.assertEqual(r["max_seconds"], 30.0)
+        # start 越过 A 的终点 → A 排除
+        r = self.report(start_ts=1011.0, bucket_seconds=60)
+        self.assertEqual(r["sample_count"], 2)  # B、C
+        # end 早于 B 的起点 → B 排除；C@2000 也在窗口之外，仅 A 计入
+        r = self.report(end_ts=1099.0, bucket_seconds=60)
+        self.assertEqual(r["sample_count"], 1)  # A
+        # 窗口完全包含所有段
+        r = self.report(start_ts=0.0, end_ts=3000.0, bucket_seconds=60)
+        self.assertEqual(r["sample_count"], 3)
+
+    def test_no_samples_returns_null_stats_and_one_empty_bucket(self):
+        r = self.report(bucket_seconds=60)
+        self.assertEqual(r["sample_count"], 0)
+        self.assertIsNone(r["min_seconds"])
+        self.assertIsNone(r["max_seconds"])
+        self.assertIsNone(r["mean_seconds"])
+        self.assertIsNone(r["median_seconds"])
+        self.assertIsNone(r["p90_seconds"])
+        self.assertEqual(len(r["buckets"]), 1)
+        bucket = r["buckets"][0]
+        self.assertEqual(bucket["bucket_index"], 0)
+        self.assertEqual(bucket["bucket_start_seconds"], 0.0)
+        self.assertEqual(bucket["bucket_end_seconds"], 60.0)
+        self.assertEqual(bucket["segment_count"], 0)
+
+    def test_reflects_current_segments_after_withdraw(self):
+        self.submit("s1", "a1", 1000.0)
+        self.submit("s1", "a2", 1020.0)    # 间隔 20 > silence → 另一段
+        self.submit("s1", "bridge", 1010.0, "critical")  # 桥接合并 → 时长 20
+        r = self.report(source="s1", bucket_seconds=60)
+        self.assertEqual(r["sample_count"], 1)
+        self.assertEqual(r["max_seconds"], 20.0)
+
+        self.withdraw("s1", "bridge")  # 拆回两段：时长 0 与 0
+        r = self.report(source="s1", bucket_seconds=60)
+        self.assertEqual(r["sample_count"], 2)
+        self.assertEqual(r["max_seconds"], 0.0)
+
+    def test_invalid_arguments_raise_value_error(self):
+        for bad in (0, -1, 0.0, -10.0, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                self.report(bucket_seconds=bad)
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=True)
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=0.0000001)  # 小于 1 微秒
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=1, start_ts=20.0, end_ts=10.0)
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=1, start_ts=float("nan"))
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=1, end_ts=float("inf"))
+
+    def test_bucket_count_limit(self):
+        # 单段时长 10000s、桶宽 1s → 10001 桶，超限
+        self.submit("s1", "e1", 0.0, silence=10**9)
+        self.submit("s1", "e2", 10000.0, silence=10**9)
+        with self.assertRaises(ValueError):
+            self.report(bucket_seconds=1)
+        # 恰好上限 10000 桶允许：s3 单段时长 9999s
+        self.submit("s3", "g1", 0.0, silence=10**9)
+        self.submit("s3", "g2", 9999.0, silence=10**9)
+        r = self.report(source="s3", bucket_seconds=1)
+        self.assertEqual(len(r["buckets"]), 10000)
+        self.assertEqual(r["buckets"][-1]["segment_count"], 1)
+
+    def test_read_only_snapshot_changes_nothing(self):
+        self._setup_segments()
+        with session(self.db_path) as conn:
+            before = [tuple(r) for r in conn.execute(
+                "SELECT * FROM segments ORDER BY id"
+            )]
+        r1 = self.report(bucket_seconds=10)
+        r2 = self.report(source="s1", start_ts=0.0, end_ts=3000.0, bucket_seconds=10)
+        r3 = self.report(bucket_seconds=10)
+        self.assertEqual(r1, r3)
+        self.assertEqual(r2["sample_count"], 2)
+        with session(self.db_path) as conn:
+            after = [tuple(r) for r in conn.execute(
+                "SELECT * FROM segments ORDER BY id"
+            )]
+        self.assertEqual(before, after)
+
+    def test_snapshot_is_consistent_against_concurrent_write(self):
+        self.submit("s1", "a1", 1000.0)
+        self.submit("s1", "a2", 1010.0)  # 时长 10
+        with read_only_session(self.db_path) as conn:
+            r1 = service.segment_duration_report(conn, bucket_seconds=60)
+            self.submit("s2", "c", 2000.0)  # 快照开启后的并发写入
+            r2 = service.segment_duration_report(conn, bucket_seconds=60)
+        self.assertEqual(r1, r2)
+        self.assertEqual(r2["sample_count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
